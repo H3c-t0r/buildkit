@@ -1,12 +1,12 @@
 package hook
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"text/template"
 
 	"github.com/buildkite/agent/v3/bootstrap/shell"
@@ -35,11 +35,11 @@ $Env:BUILDKITE_HOOK_WORKING_DIR = $PWD | Select-Object -ExpandProperty Path
 Get-ChildItem Env: | Foreach-Object {"$($_.Name)=$($_.Value)"} | Set-Content "{{.AfterEnvFileName}}"
 exit $Env:BUILDKITE_HOOK_EXIT_STATUS`
 
-	bashScript = `buildkite-agent env > "{{.BeforeEnvFileName}}"
+	bashScript = `{{.BuildkiteAgentPath}} env > "{{.BeforeEnvFileName}}"
 . "{{.PathToHook}}"
 export BUILDKITE_HOOK_EXIT_STATUS=$?
 export BUILDKITE_HOOK_WORKING_DIR=$PWD
-buildkite-agent env > "{{.AfterEnvFileName}}"
+{{.BuildkiteAgentPath}} env > "{{.AfterEnvFileName}}"
 exit $BUILDKITE_HOOK_EXIT_STATUS`
 )
 
@@ -50,9 +50,10 @@ var (
 )
 
 type scriptTemplateInput struct {
-	BeforeEnvFileName string
-	AfterEnvFileName  string
-	PathToHook        string
+	BuildkiteAgentPath string
+	BeforeEnvFileName  string
+	AfterEnvFileName   string
+	PathToHook         string
 }
 
 type HookScriptChanges struct {
@@ -92,11 +93,18 @@ type scriptWrapperOpt func(*ScriptWrapper)
 // a way to get the difference between the environment before the hook is run and
 // after it
 type ScriptWrapper struct {
-	hookPath      string
-	os            string
-	scriptFile    *os.File
-	beforeEnvFile *os.File
-	afterEnvFile  *os.File
+	buildkiteAgentPath string
+	hookPath           string
+	os                 string
+	scriptFile         *os.File
+	beforeEnvFile      *os.File
+	afterEnvFile       *os.File
+}
+
+func withBuildkiteAgentPath(path string) scriptWrapperOpt {
+	return func(wrap *ScriptWrapper) {
+		wrap.buildkiteAgentPath = path
+	}
 }
 
 func WithHookPath(path string) scriptWrapperOpt {
@@ -115,7 +123,8 @@ func WithOS(os string) scriptWrapperOpt {
 // Writes temporary files to the filesystem.
 func NewScriptWrapper(opts ...scriptWrapperOpt) (*ScriptWrapper, error) {
 	wrap := &ScriptWrapper{
-		os: runtime.GOOS,
+		buildkiteAgentPath: utils.BuildkiteAgentPath(),
+		os:                 runtime.GOOS,
 	}
 
 	for _, o := range opts {
@@ -135,12 +144,13 @@ func NewScriptWrapper(opts ...scriptWrapperOpt) (*ScriptWrapper, error) {
 
 	// we use bash hooks for scripts with no extension, otherwise on windows
 	// we probably need a .bat extension
-	if filepath.Ext(wrap.hookPath) == ".ps1" {
+	switch {
+	case filepath.Ext(wrap.hookPath) == ".ps1":
 		isPwshHook = true
 		scriptFileName += ".ps1"
-	} else if filepath.Ext(wrap.hookPath) == "" {
+	case filepath.Ext(wrap.hookPath) == "":
 		isBashHook = true
-	} else if isWindows {
+	case isWindows:
 		scriptFileName += ".bat"
 	}
 
@@ -175,31 +185,31 @@ func NewScriptWrapper(opts ...scriptWrapperOpt) (*ScriptWrapper, error) {
 	}
 
 	tmplInput := scriptTemplateInput{
-		BeforeEnvFileName: wrap.beforeEnvFile.Name(),
-		AfterEnvFileName:  wrap.afterEnvFile.Name(),
-		PathToHook:        absolutePathToHook,
+		BuildkiteAgentPath: wrap.buildkiteAgentPath,
+		BeforeEnvFileName:  wrap.beforeEnvFile.Name(),
+		AfterEnvFileName:   wrap.afterEnvFile.Name(),
+		PathToHook:         absolutePathToHook,
 	}
 
 	// Create the hook runner code
-	buf := &bytes.Buffer{}
-	if isWindows && !isBashHook && !isPwshHook {
+	buf := &strings.Builder{}
+	switch {
+	case isWindows && !isBashHook && !isPwshHook:
 		batchScriptTmpl.Execute(buf, tmplInput)
-	} else if isWindows && isPwshHook {
+	case isWindows && isPwshHook:
 		powershellScriptTmpl.Execute(buf, tmplInput)
-	} else {
+	default:
 		bashScriptTmpl.Execute(buf, tmplInput)
 	}
 	script := buf.String()
 
 	// Write the hook script to the runner then close the file so we can run it
-	_, err = wrap.scriptFile.WriteString(script)
-	if err != nil {
+	if _, err := wrap.scriptFile.WriteString(script); err != nil {
 		return nil, err
 	}
 
 	// Make script executable
-	err = utils.ChmodExecutable(wrap.scriptFile.Name())
-	if err != nil {
+	if err := utils.ChmodExecutable(wrap.scriptFile.Name()); err != nil {
 		return wrap, err
 	}
 

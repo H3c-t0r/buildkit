@@ -1445,14 +1445,14 @@ func (b *Bootstrap) defaultCheckoutPhase(ctx context.Context) error {
 	// we'll check to see if someone else has done
 	// it first.
 	b.shell.Commentf("Checking to see if Git data needs to be sent to Buildkite")
-	if err := b.shell.Run("buildkite-agent", "meta-data", "exists", "buildkite:git:commit"); err != nil {
+	if err := b.shell.Run(utils.BuildkiteAgentPath(), "meta-data", "exists", "buildkite:git:commit"); err != nil {
 		b.shell.Commentf("Sending Git commit information back to Buildkite")
 		out, err := b.shell.RunAndCapture("git", "--no-pager", "show", "HEAD", "-s", "--format=fuller", "--no-color", "--")
 		if err != nil {
 			return err
 		}
 		stdin := strings.NewReader(out)
-		if err := b.shell.WithStdin(stdin).Run("buildkite-agent", "meta-data", "set", "buildkite:git:commit"); err != nil {
+		if err := b.shell.WithStdin(stdin).Run(utils.BuildkiteAgentPath(), "meta-data", "set", "buildkite:git:commit"); err != nil {
 			return err
 		}
 	}
@@ -1863,7 +1863,7 @@ func (b *Bootstrap) uploadArtifacts(ctx context.Context) error {
 		args = append(args, b.ArtifactUploadDestination)
 	}
 
-	if err = b.shell.Run("buildkite-agent", args...); err != nil {
+	if err = b.shell.Run(utils.BuildkiteAgentPath(), args...); err != nil {
 		return err
 	}
 
