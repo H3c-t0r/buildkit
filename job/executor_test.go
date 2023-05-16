@@ -1,10 +1,10 @@
-package bootstrap
+package job
 
 import (
 	"context"
 	"testing"
 
-	"github.com/buildkite/agent/v3/bootstrap/shell"
+	"github.com/buildkite/agent/v3/job/shell"
 	"github.com/buildkite/agent/v3/redaction"
 	"github.com/buildkite/agent/v3/tracetools"
 	"github.com/opentracing/opentracing-go"
@@ -83,7 +83,7 @@ func TestStartTracing_NoTracingBackend(t *testing.T) {
 	var err error
 
 	// When there's no tracing backend, the tracer should be a no-op.
-	b := New(Config{})
+	b := NewExecutor(Config{})
 
 	oriCtx := context.Background()
 	b.shell, err = shell.New()
@@ -104,7 +104,7 @@ func TestStartTracing_Datadog(t *testing.T) {
 
 	// With the Datadog tracing backend, the global tracer should be from Datadog.
 	cfg := Config{TracingBackend: "datadog"}
-	b := New(cfg)
+	b := NewExecutor(cfg)
 
 	oriCtx := context.Background()
 	b.shell, err = shell.New()

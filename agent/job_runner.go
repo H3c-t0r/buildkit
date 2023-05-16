@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/buildkite/agent/v3/api"
-	"github.com/buildkite/agent/v3/bootstrap/shell"
 	"github.com/buildkite/agent/v3/experiments"
 	"github.com/buildkite/agent/v3/hook"
+	"github.com/buildkite/agent/v3/job/shell"
 	"github.com/buildkite/agent/v3/kubernetes"
 	"github.com/buildkite/agent/v3/logger"
 	"github.com/buildkite/agent/v3/metrics"
@@ -26,7 +26,7 @@ import (
 
 const (
 	// BuildkiteMessageMax is the maximum length of "BUILDKITE_MESSAGE=...\0"
-	// environment entry passed to bootstrap, beyond which it will be truncated
+	// environment entry passed to job executor, beyond which it will be truncated
 	// to avoid exceeding the system limit. Note that it includes the variable
 	// name, equals sign, and null terminator.
 	//
@@ -199,11 +199,11 @@ func NewJobRunner(l logger.Logger, scope *metrics.Scope, ag *api.AgentRegisterRe
 		return nil, err
 	}
 
-	// The bootstrap-script gets parsed based on the operating system
-	cmd, err := shellwords.Split(conf.AgentConfiguration.BootstrapScript)
+	// The job executor script gets parsed based on the operating system
+	cmd, err := shellwords.Split(conf.AgentConfiguration.JobRunScript)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to split bootstrap-script (%q) into tokens: %v",
-			conf.AgentConfiguration.BootstrapScript, err)
+		return nil, fmt.Errorf("Failed to split job executor script (%q) into tokens: %v",
+			conf.AgentConfiguration.JobRunScript, err)
 	}
 
 	// Our log streamer works off a buffer of output
@@ -311,6 +311,7 @@ func NewJobRunner(l logger.Logger, scope *metrics.Scope, ag *api.AgentRegisterRe
 			ClientCount: containerCount,
 		})
 	} else {
+		// The process that will run the job executor script
 		runner.process = process.New(l, process.Config{
 			Path:            cmd[0],
 			Args:            cmd[1:],
@@ -337,6 +338,37 @@ func NewJobRunner(l logger.Logger, scope *metrics.Scope, ag *api.AgentRegisterRe
 	}()
 
 	return runner, nil
+}
+
+type hookExit struct {
+	ExitStatus   int
+	SignalReason string
+	Ok           bool
+}
+
+func (r *JobRunner) preExecHook(ctx context.Context, hookName string) hookExit {
+	exit := hookExit{Ok: true}
+	hookPath, _ := hook.Find(r.conf.AgentConfiguration.HooksPath, hookName)
+	if hookPath == "" {
+		return exit
+	}
+
+	// Once we have a hook any failure to run it MUST be fatal to the job to guarantee a true
+	// positive result from the hook
+	okay, err := r.executePreExecHook(ctx, hookName, hookPath)
+	if !okay {
+		exit.Ok = false
+
+		// Ensure the Job UI knows why this job resulted in failure
+		r.logStreamer.Process([]byte(fmt.Sprintf("%s hook rejected this job, see the buildkite-agent logs for more details", hookName)))
+		// But disclose more information in the agent logs
+		r.logger.Error("%s hook rejected this job: %s", hookName, err)
+
+		exit.ExitStatus = -1
+		exit.SignalReason = "agent_refused"
+	}
+
+	return exit
 }
 
 // Runs the job
@@ -374,139 +406,87 @@ func (r *JobRunner) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Default exit status is no exit status
-	exitStatus := ""
-	signal := ""
-	signalReason := ""
-
-	// Before executing the bootstrap process with the received Job env,
-	// execute the pre-bootstrap hook (if present) for it to tell us
+	hookExit := r.preExecHooks(ctx)
+	// Before executing the job process with the received Job env,
+	// execute the pre-bootstrap/pre-exec hook (if present) for it to tell us
 	// whether it is happy to proceed.
-	environmentCommandOkay := true
+	// Default exit status is no exit status
+	signal := ""
+	exitStatus := strconv.Itoa(hookExit.ExitStatus)
+	signalReason := hookExit.SignalReason
 
-	if hook, _ := hook.Find(r.conf.AgentConfiguration.HooksPath, "pre-bootstrap"); hook != "" {
-		// Once we have a hook any failure to run it MUST be fatal to the job to guarantee a true
-		// positive result from the hook
-		okay, err := r.executePreBootstrapHook(ctx, hook)
-		if !okay {
-			environmentCommandOkay = false
-
-			// Ensure the Job UI knows why this job resulted in failure
-			r.logStreamer.Process([]byte("pre-bootstrap hook rejected this job, see the buildkite-agent logs for more details"))
-			// But disclose more information in the agent logs
-			r.logger.Error("pre-bootstrap hook rejected this job: %s", err)
-
-			exitStatus = "-1"
-			signalReason = "agent_refused"
-		}
-	}
-
-	// Used to wait on various routines that we spin up
 	var wg sync.WaitGroup
-
 	// Set up a child context for helper goroutines related to running the job.
 	cctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	defer func() {
+		// Finish the build in the Buildkite Agent API
+		//
+		// Once we tell the API we're finished it might assign us new work, so make
+		// sure everything else is done first.
+		r.finishJob(ctx, startedAt, cancel, &wg, exitStatus, signal, signalReason)
 
-	if environmentCommandOkay {
-		// Kick off log streaming and job status checking when the process
-		// starts.
-		wg.Add(2)
-		go r.jobLogStreamer(cctx, &wg)
-		go r.jobCancellationChecker(cctx, &wg)
+		r.logger.Info("Finished job %s", r.job.ID)
+	}()
 
-		// Run the process. This will block until it finishes.
-		if err := r.process.Run(cctx); err != nil {
-			// Send the error as output
-			r.logStreamer.Process([]byte(err.Error()))
-
-			// The process did not run at all, so make sure it fails
-			exitStatus = "-1"
-			signalReason = "process_run_error"
-		} else {
-			// Intended to capture situations where the job-exec (aka bootstrap) container did not
-			// start. Normally such errors are hidden in the Kubernetes events. Let's feed them up
-			// to the user as they may be the caused by errors in the pipeline definition.
-			if r.cancelled && !r.stopped {
-				k8sProcess, ok := r.process.(*kubernetes.Runner)
-				if ok && k8sProcess.ClientStateUnknown() {
-					r.logStreamer.Process([]byte(
-						"Some containers had unknown exit statuses. Perhaps they were in ImagePullBackOff.",
-					))
-				}
-			}
-
-			// Add the final output to the streamer
-			r.logStreamer.Process(r.output.ReadAndTruncate())
-
-			// Collect the finished process' exit status
-			exitStatus = fmt.Sprintf("%d", r.process.WaitStatus().ExitStatus())
-			if ws := r.process.WaitStatus(); ws.Signaled() {
-				signal = process.SignalString(ws.Signal())
-			}
-			if r.stopped {
-				// The agent is being gracefully stopped, and we signaled the job to end. Often due
-				// to pending host shutdown or EC2 spot instance termination
-				signalReason = "agent_stop"
-			} else if r.cancelled {
-				// The job was signaled because it was cancelled via the buildkite web UI
-				signalReason = "cancel"
-			}
-		}
+	if !hookExit.Ok {
+		return nil
 	}
 
-	// Store the finished at time
-	finishedAt := time.Now()
+	// Kick off log streaming and job status checking when the process starts.
+	wg.Add(2)
+	go r.jobLogStreamer(cctx, &wg)
+	go r.jobCancellationChecker(cctx, &wg)
 
-	// Stop the header time streamer. This will block until all the chunks
-	// have been uploaded
-	r.headerTimesStreamer.Stop()
+	// Run the process. This will block until it finishes.
+	if err := r.process.Run(cctx); err != nil {
+		// Send the error as output
+		r.logStreamer.Process([]byte(err.Error()))
 
-	// Stop the log streamer. This will block until all the chunks have
-	// been uploaded
-	r.logStreamer.Stop()
-
-	// Warn about failed chunks
-	if count := r.logStreamer.FailedChunks(); count > 0 {
-		r.logger.Warn("%d chunks failed to upload for this job", count)
-	}
-
-	// Ensure the additional goroutines are stopped.
-	cancel()
-
-	// Wait for the routines that we spun up to finish
-	r.logger.Debug("[JobRunner] Waiting for all other routines to finish")
-	wg.Wait()
-
-	// Remove the env file, if any
-	if r.envFile != nil {
-		if err := os.Remove(r.envFile.Name()); err != nil {
-			r.logger.Warn("[JobRunner] Error cleaning up env file: %s", err)
-		}
-		r.logger.Debug("[JobRunner] Deleted env file: %s", r.envFile.Name())
-	}
-
-	// Write some metrics about the job run
-	jobMetrics := r.metrics.With(metrics.Tags{
-		"exit_code": exitStatus,
-	})
-	if exitStatus == "0" {
-		jobMetrics.Timing("jobs.duration.success", finishedAt.Sub(startedAt))
-		jobMetrics.Count("jobs.success", 1)
+		// The process did not run at all, so make sure it fails
+		exitStatus = "-1"
+		signalReason = "process_run_error"
 	} else {
-		jobMetrics.Timing("jobs.duration.error", finishedAt.Sub(startedAt))
-		jobMetrics.Count("jobs.failed", 1)
+		// Intended to capture situations where the job-exec (aka bootstrap) container did not
+		// start. Normally such errors are hidden in the Kubernetes events. Let's feed them up
+		// to the user as they may be the caused by errors in the pipeline definition.
+		if r.cancelled && !r.stopped {
+			k8sProcess, ok := r.process.(*kubernetes.Runner)
+			if ok && k8sProcess.ClientStateUnknown() {
+				r.logStreamer.Process([]byte(
+					"Some containers had unknown exit statuses. Perhaps they were in ImagePullBackOff.",
+				))
+			}
+		}
+
+		// Add the final output to the streamer
+		r.logStreamer.Process(r.output.ReadAndTruncate())
+
+		// Collect the finished process' exit status
+		exitStatus = fmt.Sprintf("%d", r.process.WaitStatus().ExitStatus())
+		if ws := r.process.WaitStatus(); ws.Signaled() {
+			signal = process.SignalString(ws.Signal())
+		}
+		if r.stopped {
+			// The agent is being gracefully stopped, and we signaled the job to end. Often due
+			// to pending host shutdown or EC2 spot instance termination
+			signalReason = "agent_stop"
+		} else if r.cancelled {
+			// The job was signaled because it was cancelled via the buildkite web UI
+			signalReason = "cancel"
+		}
 	}
-
-	// Finish the build in the Buildkite Agent API
-	//
-	// Once we tell the API we're finished it might assign us new work, so make
-	// sure everything else is done first.
-	r.finishJob(ctx, finishedAt, exitStatus, signal, signalReason, r.logStreamer.FailedChunks())
-
-	r.logger.Info("Finished job %s", r.job.ID)
 
 	return nil
+}
+
+func (r *JobRunner) preExecHooks(ctx context.Context) hookExit {
+	hookExit := r.preExecHook(ctx, "pre-bootstrap")
+	if !hookExit.Ok {
+		return hookExit
+	}
+
+	return r.preExecHook(ctx, "pre-exec")
+
 }
 
 func (r *JobRunner) CancelAndStop() error {
@@ -595,7 +575,7 @@ func (r *JobRunner) createEnvironment() ([]string, error) {
 		}
 	}
 
-	// Set BUILDKITE_IGNORED_ENV so the bootstrap can show warnings
+	// Set BUILDKITE_IGNORED_ENV so the job executor can show warnings
 	if len(ignoredEnv) > 0 {
 		env["BUILDKITE_IGNORED_ENV"] = strings.Join(ignoredEnv, ",")
 	}
@@ -645,19 +625,19 @@ func (r *JobRunner) createEnvironment() ([]string, error) {
 	env["BUILDKITE_AGENT_EXPERIMENT"] = strings.Join(experiments.Enabled(), ",")
 	env["BUILDKITE_REDACTED_VARS"] = strings.Join(r.conf.AgentConfiguration.RedactedVars, ",")
 
-	// propagate CancelSignal to bootstrap, unless it's the default SIGTERM
+	// propagate CancelSignal to job executor, unless it's the default SIGTERM
 	if r.conf.CancelSignal != process.SIGTERM {
 		env["BUILDKITE_CANCEL_SIGNAL"] = r.conf.CancelSignal.String()
 	}
 
-	// Whether to enable profiling in the bootstrap
+	// Whether to enable profiling in the job executor
 	if r.conf.AgentConfiguration.Profile != "" {
 		env["BUILDKITE_AGENT_PROFILE"] = r.conf.AgentConfiguration.Profile
 	}
 
-	// PTY-mode is enabled by default in `start` and `bootstrap`, so we only need
+	// PTY-mode is enabled by default in `start` and `job-exec`, so we only need
 	// to propagate it if it's explicitly disabled.
-	if r.conf.AgentConfiguration.RunInPty == false {
+	if !r.conf.AgentConfiguration.RunInPty {
 		env["BUILDKITE_PTY"] = "false"
 	}
 
@@ -721,8 +701,8 @@ func (w LogWriter) Write(bytes []byte) (int, error) {
 	return len(bytes), nil
 }
 
-func (r *JobRunner) executePreBootstrapHook(ctx context.Context, hook string) (bool, error) {
-	r.logger.Info("Running pre-bootstrap hook %q", hook)
+func (r *JobRunner) executePreExecHook(ctx context.Context, hookName, hookPath string) (bool, error) {
+	r.logger.Info("Running %s hook %q", hookName, hookPath)
 
 	sh, err := shell.New()
 	if err != nil {
@@ -730,19 +710,19 @@ func (r *JobRunner) executePreBootstrapHook(ctx context.Context, hook string) (b
 	}
 
 	// This (plus inherited) is the only ENV that should be exposed
-	// to the pre-bootstrap hook.
+	// to the pre-exec hook.
 	sh.Env.Set("BUILDKITE_ENV_FILE", r.envFile.Name())
 
 	sh.Writer = LogWriter{
 		l: r.logger,
 	}
 
-	if err := sh.RunWithoutPrompt(ctx, hook); err != nil {
-		r.logger.Error("Finished pre-bootstrap hook %q: job rejected", hook)
+	if err := sh.RunWithoutPrompt(ctx, hookPath); err != nil {
+		r.logger.Error("Finished %s hook %q: job rejected", hookName, hookPath)
 		return false, err
 	}
 
-	r.logger.Info("Finished pre-bootstrap hook %q: job accepted", hook)
+	r.logger.Info("Finished %s hook %q: job accepted", hookName, hookPath)
 	return true, nil
 }
 
@@ -776,18 +756,61 @@ func (r *JobRunner) startJob(ctx context.Context, startedAt time.Time) error {
 
 // finishJob finishes the job in the Buildkite Agent API. If the FinishJob call
 // cannot return successfully, this will retry for a long time.
-func (r *JobRunner) finishJob(ctx context.Context, finishedAt time.Time, exitStatus, signal, signalReason string, failedChunkCount int) error {
+func (r *JobRunner) finishJob(ctx context.Context, startedAt time.Time, cancel func(), wg *sync.WaitGroup, exitStatus, signal, signalReason string) error {
+	finishedAt := time.Now()
+
+	// Stop the header time streamer. This will block until all the chunks
+	// have been uploaded
+	r.headerTimesStreamer.Stop()
+
+	// Stop the log streamer. This will block until all the chunks have
+	// been uploaded
+	r.logStreamer.Stop()
+
+	// Warn about failed chunks
+	if count := r.logStreamer.FailedChunks(); count > 0 {
+		r.logger.Warn("%d chunks failed to upload for this job", count)
+	}
+
+	// Ensure the additional goroutines are stopped.
+	cancel()
+
+	// Wait for the routines that we spun up to finish
+	r.logger.Debug("[JobRunner] Waiting for all other routines to finish")
+	wg.Wait()
+
+	// Remove the env file, if any
+	if r.envFile != nil {
+		if err := os.Remove(r.envFile.Name()); err != nil {
+			r.logger.Warn("[JobRunner] Error cleaning up env file: %s", err)
+		}
+		r.logger.Debug("[JobRunner] Deleted env file: %s", r.envFile.Name())
+	}
+
+	// Write some metrics about the job run
+	jobMetrics := r.metrics.With(metrics.Tags{
+		"exit_code": exitStatus,
+	})
+
+	if exitStatus == "0" {
+		jobMetrics.Timing("jobs.duration.success", finishedAt.Sub(startedAt))
+		jobMetrics.Count("jobs.success", 1)
+	} else {
+		jobMetrics.Timing("jobs.duration.error", finishedAt.Sub(startedAt))
+		jobMetrics.Count("jobs.failed", 1)
+	}
+
 	r.job.FinishedAt = finishedAt.UTC().Format(time.RFC3339Nano)
 	r.job.ExitStatus = exitStatus
 	r.job.Signal = signal
 	r.job.SignalReason = signalReason
-	r.job.ChunksFailedCount = failedChunkCount
+	r.job.ChunksFailedCount = r.logStreamer.FailedChunks()
 
 	r.logger.Debug("[JobRunner] Finishing job with exit_status=%s, signal=%s and signal_reason=%s",
 		r.job.ExitStatus, r.job.Signal, r.job.SignalReason)
 
-	ctx, cancel := context.WithTimeout(ctx, 48*time.Hour)
-	defer cancel()
+	ctx, ccancel := context.WithTimeout(ctx, 48*time.Hour)
+	defer ccancel()
 
 	return roko.NewRetrier(
 		roko.TryForever(),
