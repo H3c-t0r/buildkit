@@ -69,6 +69,10 @@ type Shell struct {
 
 	// The signal to use to interrupt the command
 	InterruptSignal process.Signal
+
+	// Whether to use a base-64 JSON encoding when propagating trace contexts.
+	// If false, uses gob (golang-binary).
+	UseJsonTraceContext bool
 }
 
 // New returns a new Shell
@@ -316,7 +320,7 @@ func (s *Shell) injectTraceCtx(ctx context.Context, env *env.Environment) {
 	if span == nil {
 		return
 	}
-	if err := tracetools.EncodeTraceContext(span, env.Dump()); err != nil {
+	if err := tracetools.EncodeTraceContext(span, env.Dump(), s.UseJsonTraceContext); err != nil {
 		if s.Debug {
 			s.Logger.Warningf("Failed to encode trace context: %v", err)
 		}
