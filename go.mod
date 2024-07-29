@@ -24,7 +24,7 @@ require (
 	github.com/dustinkirkland/golang-petname v0.0.0-20231002161417-6a283f1aaaf2
 	github.com/gliderlabs/ssh v0.3.7
 	github.com/go-chi/chi/v5 v5.1.0
-	github.com/gofrs/flock v0.12.0
+	github.com/gofrs/flock v0.12.1
 	github.com/google/go-cmp v0.6.0
 	github.com/google/go-querystring v1.1.0
 	github.com/gowebpki/jcs v1.0.1
@@ -50,7 +50,7 @@ require (
 	golang.org/x/crypto v0.24.0
 	golang.org/x/exp v0.0.0-20231108232855-2478ac86f678
 	golang.org/x/oauth2 v0.21.0
-	golang.org/x/sys v0.21.0
+	golang.org/x/sys v0.22.0
 	golang.org/x/term v0.21.0
 	google.golang.org/api v0.185.0
 	gopkg.in/DataDog/dd-trace-go.v1 v1.65.1
